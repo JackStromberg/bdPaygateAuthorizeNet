@@ -10,6 +10,7 @@
 	<li>{errors}</li>
 </ul>]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_city" version_id="1000000" version_string="1.0.0"><![CDATA[City]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_country" version_id="1000000" version_string="1.0.0"><![CDATA[Country]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_credit_card_amex" version_id="1000000" version_string="1.0.0"><![CDATA[American Express]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_credit_card_diners_club" version_id="1000000" version_string="1.0.0"><![CDATA[Diners Club]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_credit_card_discover" version_id="1000000" version_string="1.0.0"><![CDATA[Discover]]></phrase>

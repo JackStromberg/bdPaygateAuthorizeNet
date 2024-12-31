@@ -192,6 +192,7 @@ class Provider extends AbstractProvider
             $inputFilters['city'] = 'str';
             $inputFilters['state'] = 'str';
             $inputFilters['zip'] = 'str';
+            $inputFilters['country'] = 'str';
         }
         $inputs = $controller->filter($inputFilters);
         foreach (array_keys($inputFilters) as $inputKey) {

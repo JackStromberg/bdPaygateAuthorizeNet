@@ -126,11 +126,12 @@ class Sdk
             $customerAddress->setPhoneNumber($inputs['phone_number']);
             $customerAddressHasData = true;
         }
-        if (isset($inputs['address']) && isset($inputs['city']) && isset($inputs['state']) && isset($inputs['zip'])) {
+        if (isset($inputs['address']) && isset($inputs['city']) && isset($inputs['state']) && isset($inputs['zip']) && isset($inputs['country'])) {
             $customerAddress->setAddress($inputs['address']);
             $customerAddress->setCity($inputs['city']);
             $customerAddress->setState($inputs['state']);
             $customerAddress->setZip($inputs['zip']);
+            $customerAddress->setCountry($inputs['country']);
             $customerAddressHasData = true;
         }
 
