@@ -5,11 +5,15 @@ namespace Xfrocks\AuthorizeNetArb\Payment;
 use XF\Entity\PaymentProfile;
 use XF\Entity\PaymentProviderLog;
 use XF\Entity\PurchaseRequest;
+use XF\Entity\UserUpgradeActive;
+use XF\Finder\PaymentProfileFinder;
+use XF\Finder\PaymentProviderLogFinder;
+use XF\Finder\UserUpgradeActiveFinder;
 use XF\Mvc\Controller;
 use XF\Payment\AbstractProvider;
 use XF\Payment\CallbackState;
 use XF\Purchasable\Purchase;
-use XF\Repository\Payment;
+use XF\Repository\PaymentRepository;
 use Xfrocks\AuthorizeNetArb\Util\Sdk;
 
 class Provider extends AbstractProvider
@@ -19,6 +23,10 @@ class Provider extends AbstractProvider
      */
     public function getCallbackUrl()
     {
+        // Authorize.net's webhook management API rejects callback URLs containing query
+        // string parameters. This shim provides a clean URL that Authorize.net
+        // accepts, then injects the _xfProvider parameter and delegates to XenForo's
+        // standard payment callback handler.
         if (\XF::$debugMode) {
             $callbackUrl = \XF::config(__METHOD__);
             if (is_string($callbackUrl)) {
@@ -53,6 +61,13 @@ class Provider extends AbstractProvider
     {
         return 'Authorize.Net with ARB';
     }
+    protected function getSupportedRecurrenceRanges()
+    {
+        return [
+            'day' => [7, 365],
+            'month' => [1, 12],
+        ];
+    }
 
     /**
      * @param Controller $controller
@@ -62,14 +77,14 @@ class Provider extends AbstractProvider
      */
     public function initiatePayment(Controller $controller, PurchaseRequest $purchaseRequest, Purchase $purchase)
     {
-        $displayCardIcons = false;
         $prefix = 'display_creditcards_';
         $prefixLength = strlen($prefix);
         $acceptedCards = [];
-        foreach($purchase->paymentProfile->options as $key => $value){
-            if(substr($key, 0, $prefixLength) == $prefix) { 
-                if (!in_array($prefix, $acceptedCards)) {
-                    $acceptedCards[] = substr($key, $prefixLength);
+        foreach ($purchase->paymentProfile->options as $key => $value) {
+            if (substr($key, 0, $prefixLength) === $prefix) {
+                $cardName = substr($key, $prefixLength);
+                if (!in_array($cardName, $acceptedCards)) {
+                    $acceptedCards[] = $cardName;
                 }
             }
         }
@@ -121,37 +136,56 @@ class Provider extends AbstractProvider
         PurchaseRequest $purchaseRequest,
         PaymentProfile $paymentProfile
     ) {
-        $logFinder = \XF::finder('XF:PaymentProviderLog')
+        $subscriptionId = null;
+    
+        // 1. Try finding ID in the Logs
+        $logFinder = \XF::finder(PaymentProviderLogFinder::class)
             ->where('purchase_request_key', $purchaseRequest->request_key)
             ->where('provider_id', $this->getProviderId())
             ->order('log_date', 'desc');
 
         $logs = $logFinder->fetch();
-
-        $subscriptionId = null;
         foreach ($logs as $log) {
             if ($log->subscriber_id) {
                 $subscriptionId = $log->subscriber_id;
                 break;
             }
         }
-
+    
+        // 2. FALLBACK: Check Active Upgrade record
         if (!$subscriptionId) {
-            return $controller->error('Could not find a subscriber ID or customer ID for this purchase request.');
+            $activeUpgrade = \XF::finder(UserUpgradeActiveFinder::class)
+                ->where('purchase_request_key', $purchaseRequest->request_key)
+                ->fetchOne();
+        
+            if ($activeUpgrade && !empty($activeUpgrade->extra['subscriber_id'])) {
+                $subscriptionId = $activeUpgrade->extra['subscriber_id'];
+            }
         }
-
+    
+        // 3. If still missing, cannot cancel
+        if (!$subscriptionId) {
+            return $controller->error('Could not find a subscriber ID to cancel.');
+        }
+    
+        // 4. Cancel at Authorize.Net
         $unSubscribed = false;
         try {
             $unSubscribed = Sdk::unSubscribe($paymentProfile, $subscriptionId);
         } catch (\Exception $e) {
             \XF::logException($e);
+            return $controller->error('Authorize.Net API Error: ' . $e->getMessage());
         }
+    
         if (!$unSubscribed) {
             throw $controller->exception($controller->error(
                 \XF::phrase('this_subscription_cannot_be_cancelled_maybe_already_cancelled')
             ));
         }
-
+    
+        // 5. Use XenForo's standard handler (proper way)
+        $purchaseRequest->Purchasable->handler->processCancellation($purchaseRequest);
+    
         return $controller->redirect(
             $controller->getDynamicRedirect(),
             \XF::phrase('Xfrocks_AuthorizeNetArb_subscription_cancelled_successfully')
@@ -216,22 +250,23 @@ class Provider extends AbstractProvider
 
         $chargeOk = ($chargeResult->isOk() && $chargeResult->getResponseCode() === Sdk::RESPONSE_CODE_TRANSACTION_APPROVED);
         $chargeLogType = $chargeOk ? 'info' : 'error';
-        /** @var Payment $paymentRepo */
-        $paymentRepo = \XF::repository('XF:Payment');
-        $paymentRepo->logCallback(
-            $purchaseRequest->request_key,
-            $this->getProviderId(),
-            $chargeResult->getTransId(),
-            $chargeLogType,
-            'Authorize.Net charge ' . $chargeLogType,
-            ['charge' => $chargeResult->toArray()]
-        );
+        /** @var PaymentRepository $paymentRepo */
+        $paymentRepo = \XF::repository(PaymentRepository::class);
 
         if (!$chargeOk) {
+            $paymentRepo->logCallback(
+                $purchaseRequest->request_key,
+                $this->getProviderId(),
+                $chargeResult->getTransId(),
+                $chargeLogType,
+                'Authorize.Net charge ' . $chargeLogType,
+                ['charge' => $chargeResult->toArray()]
+            );
+
             $chargeErrors = $chargeResult->getTransactionErrors();
             if (count($chargeErrors) > 0) {
                 $errorPhrase = \XF::phrase('Xfrocks_AuthorizeNetArb_charge_errors_x', [
-                    'errors' => implode('</li><li>', $chargeErrors)
+                    'errors' => implode(', ', $chargeErrors)
                 ]);
             } else {
                 $errorPhrase = \XF::phrase('something_went_wrong_please_try_again');
@@ -241,11 +276,11 @@ class Provider extends AbstractProvider
         }
         /** @var Sdk\ChargeResult $chargeResultOk */
         $chargeResultOk = $chargeResult;
+        $subscribeLogSubId = null; // Initialize variable
 
         if ($purchase->recurring) {
             $subscribeLogType = 'error';
             $subscribeLogDetails = [];
-            $subscribeLogSubId = null;
 
             try {
                 $customerProfile = Sdk::createCustomerProfileFromTransaction($paymentProfile, $chargeResultOk);
@@ -278,15 +313,24 @@ class Provider extends AbstractProvider
                 $subscribeLogSubId
             );
         }
-
+        // Log the charge with the subscriber ID
+        $paymentRepo->logCallback(
+            $purchaseRequest->request_key,
+            $this->getProviderId(),
+            $chargeResult->getTransId(),
+            $chargeLogType,
+            'Authorize.Net charge ' . $chargeLogType,
+            ['charge' => $chargeResult->toArray()],
+            $subscribeLogSubId // <--- Passes the ID to the upgrade record
+        );
         return $controller->redirect($purchase->returnUrl);
     }
 
     /**
-     * @param \XF\Entity\UserUpgradeActive $active
+     * @param UserUpgradeActive $active
      * @return string
      */
-    public function renderCancellation(\XF\Entity\UserUpgradeActive $active)
+    public function renderCancellation(UserUpgradeActive $active)
     {
         $data = [
             'active' => $active,
@@ -358,10 +402,10 @@ class Provider extends AbstractProvider
      */
     public function validateCallback(CallbackState $state)
     {
-        /** @var Payment $paymentRepo */
-        $paymentRepo = \XF::repository('XF:Payment');
+        /** @var PaymentRepository $paymentRepo */
+        $paymentRepo = \XF::repository(PaymentRepository::class);
 
-        $allPaymentProfiles = $paymentRepo->finder('XF:PaymentProfile')
+        $allPaymentProfiles = \XF::finder(PaymentProfileFinder::class)
             ->where('active', true)
             ->where('provider_id', $this->getProviderId());
         $paymentProfile = null;
@@ -415,7 +459,7 @@ class Provider extends AbstractProvider
                     $state->subscriberId = $subscriptionId;
 
                     /** @var PaymentProviderLog|null $providerLog */
-                    $providerLog = \XF::em()->findOne('XF:PaymentProviderLog', [
+                    $providerLog = \XF::em()->findOne(PaymentProviderLog::class, [
                         'subscriber_id' => $subscriptionId,
                         'provider_id' => $this->getProviderId()
                     ]);
@@ -449,7 +493,7 @@ class Provider extends AbstractProvider
                         $purchaseRequestId = $matches[1];
 
                         /** @var PurchaseRequest|null $purchaseRequest */
-                        $purchaseRequest = \XF::em()->findOne('XF:PurchaseRequest', [
+                        $purchaseRequest = \XF::em()->findOne(PurchaseRequest::class, [
                             'purchase_request_id' => $purchaseRequestId,
                             'payment_profile_id' => $state->paymentProfile->payment_profile_id,
                         ]);
@@ -461,6 +505,28 @@ class Provider extends AbstractProvider
                 }
             }
         }
+
+        // --- START FIX: Recovery of Missing Subscriber ID ---
+        // If Authorize.Net webhook didn't include the Subscription ID,
+        // retrieve it from our logs saved during initial checkout.
+        if (!$state->subscriberId) {
+            // Get request key from state or fallback to purchase request
+            $requestKey = $state->requestKey ?: ($state->purchaseRequest ? $state->purchaseRequest->request_key : null);
+
+            if ($requestKey) {
+                $logWithSubId = \XF::finder(PaymentProviderLogFinder::class)
+                    ->where('purchase_request_key', $requestKey)
+                    ->where('provider_id', $this->getProviderId())
+                    ->where('subscriber_id', '!=', null)
+                    ->order('log_date', 'desc')
+                    ->fetchOne();
+
+                if ($logWithSubId && $logWithSubId->subscriber_id) {
+                    $state->subscriberId = $logWithSubId->subscriber_id;
+                }
+            }
+        }
+        // --- END FIX ---
 
         if (!$state->getPurchaseRequest()) {
             $state->logType = 'error';
@@ -552,5 +618,131 @@ class Provider extends AbstractProvider
         }
 
         return parent::verifyConfig($options, $errors);
+    }
+    public function completeTransaction(CallbackState $state)
+    {
+        parent::completeTransaction($state);
+
+        // Inject Subscriber ID into upgrade record's 'extra' field
+        if ($state->subscriberId && $state->requestKey) {
+            $upgrade = \XF::finder(UserUpgradeActiveFinder::class)
+                ->where('purchase_request_key', $state->requestKey)
+                ->fetchOne();
+
+            if ($upgrade) {
+                // Get existing extra data or initialize empty array
+                $extra = $upgrade->extra ?: [];
+                
+                // Add the missing Subscriber ID
+                $extra['subscriber_id'] = $state->subscriberId;
+
+                // Add payment_profile_id if available
+                if ($state->paymentProfile) {
+                    $extra['payment_profile_id'] = $state->paymentProfile->payment_profile_id;
+                }
+
+                // Save back to the entity (XF handles the JSON encoding)
+                $upgrade->extra = $extra;
+                $upgrade->save();
+            }
+        }
+
+    }
+
+    /**
+     * VISIBILITY FIX: This forces the Cancel button to render using the default template.
+     */
+    public function renderCancellationTemplate(PurchaseRequest $purchaseRequest)
+    {
+        return $this->renderCancellationDefault($purchaseRequest);
+    }
+
+    /**
+     * Indicates this provider supports admin-initiated refunds.
+     * Works with the Jack/PaymentRefund add-on if installed, but does not require it.
+     * If Jack/PaymentRefund is not installed, these methods simply exist but are never called.
+     */
+    public function supportsRefunds(): bool
+    {
+        return true;
+    }
+
+    /**
+     * Issue a refund via the Authorize.Net API.
+     *
+     * @param PaymentProfile $paymentProfile The payment profile with credentials
+     * @param PurchaseRequest $purchaseRequest The original purchase request
+     * @param string $transactionId The Authorize.Net transaction ID to refund
+     * @param float|null $amount Refund amount (null = full refund)
+     * @param string $currency Currency code (only USD supported)
+     * @return array{success: bool, provider_refund_id?: string, error?: string}
+     */
+    public function refund(
+        PaymentProfile $paymentProfile,
+        PurchaseRequest $purchaseRequest,
+        string $transactionId,
+        ?float $amount = null,
+        string $currency = 'USD'
+    ): array
+    {
+        if ($currency !== 'USD')
+        {
+            return [
+                'success' => false,
+                'error' => 'Authorize.Net only supports USD refunds.',
+            ];
+        }
+
+        // Resolve the original transaction ID from the log entry.
+        // The transactionId passed in is the event ID from the webhook log,
+        // but we need the actual Authorize.Net transaction ID.
+        $actualTransId = $this->resolveTransactionId($purchaseRequest, $transactionId);
+        if (!$actualTransId)
+        {
+            return [
+                'success' => false,
+                'error' => 'Could not determine the Authorize.Net transaction ID.',
+            ];
+        }
+
+        // If no amount specified, use the full purchase cost
+        if ($amount === null)
+        {
+            $amount = (float) $purchaseRequest->cost_amount;
+        }
+
+        return Sdk::refund($paymentProfile, $actualTransId, $amount);
+    }
+
+    /**
+     * Resolve the actual Authorize.Net transaction ID from logs.
+     * The charge log stores the real transaction ID in log_details.
+     */
+    protected function resolveTransactionId(PurchaseRequest $purchaseRequest, string $transactionId): ?string
+    {
+        // The transactionId on the log entry might already be the Authorize.Net transaction ID
+        // Check if it looks like a numeric Authorize.Net transaction ID
+        if (is_numeric($transactionId))
+        {
+            return $transactionId;
+        }
+
+        // Fall back to searching the payment log for the charge transaction ID
+        $logFinder = \XF::finder(PaymentProviderLogFinder::class)
+            ->where('purchase_request_key', $purchaseRequest->request_key)
+            ->where('provider_id', $this->getProviderId())
+            ->where('log_type', 'info')
+            ->order('log_date', 'DESC');
+
+        foreach ($logFinder->fetch() as $log)
+        {
+            $details = $log->log_details;
+            if (isset($details['charge']['_transId']))
+            {
+                return $details['charge']['_transId'];
+            }
+        }
+
+        return null;
     }
 }
