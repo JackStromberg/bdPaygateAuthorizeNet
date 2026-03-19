@@ -177,6 +177,11 @@ class Sdk
         $transactionRequest->setPayment($payment);
         $transactionRequest->setTransactionType('authCaptureTransaction');
 
+        $customerIp = self::getIpAddressForAuthorizeNet();
+        if ($customerIp !== null) {
+            $transactionRequest->setCustomerIp($customerIp);
+        }
+
         $request = new AnetAPI\CreateTransactionRequest();
         $request->setMerchantAuthentication(self::newMerchantAuthentication($paymentProfile));
         $request->setTransactionRequest($transactionRequest);
@@ -201,6 +206,14 @@ class Sdk
      */
     public static function createCustomerProfileFromTransaction($paymentProfile, $chargeOk)
     {
+        // --- START FIX: Authorize.Net SDK 2.0.2 Bug Workaround ---
+        if (!class_exists('net\authorize\api\contract\v1\CreateCustomerProfileFromTransactionResponse')) {
+            class_alias(
+                'net\authorize\api\contract\v1\CreateCustomerProfileResponse',
+                'net\authorize\api\contract\v1\CreateCustomerProfileFromTransactionResponse'
+            );
+        }
+        // --- END FIX ---
         self::autoload();
 
         $transId = $chargeOk->getTransId();
@@ -265,6 +278,17 @@ class Sdk
     public static function subscribe($purchaseRequest, $purchase, $customerProfile, $attemptId = 0)
     {
         self::autoload();
+
+        // --- START WAIT LOGIC ---
+        // Wait before first attempt to ensure Customer Profile is ready
+        if ($attemptId === 0) {
+            $enableLivePayments = \XF::config('enableLivePayments');
+            // Sandbox needs extra time for profile propagation
+            if (!$enableLivePayments) {
+                sleep(15);
+            }
+        }
+        // --- END WAIT LOGIC ---
 
         self::assertRecurringLength($purchase->lengthAmount, $purchase->lengthUnit);
 
@@ -375,6 +399,116 @@ class Sdk
             return true;
         } else {
             return false;
+        }
+    }
+
+    /**
+     * Issue a refund for a previously captured transaction.
+     *
+     * Authorize.Net refunds require the original transaction ID and the last 4 digits
+     * of the credit card. We retrieve these from the transaction details API.
+     *
+     * @param PaymentProfile $paymentProfile
+     * @param string $transId The original transaction ID to refund
+     * @param float $amount The refund amount
+     * @return array{success: bool, provider_refund_id?: string, error?: string}
+     */
+    public static function refund(PaymentProfile $paymentProfile, string $transId, float $amount): array
+    {
+        self::autoload();
+
+        // First, get the original transaction details to obtain card info
+        $transactionDetails = self::getTransactionDetails($paymentProfile, $transId);
+        if (!$transactionDetails->isOk())
+        {
+            return [
+                'success' => false,
+                'error' => 'Could not retrieve original transaction details: '
+                    . implode(', ', $transactionDetails->getApiMessages()),
+            ];
+        }
+
+        $detailsArray = $transactionDetails->toArray();
+        $cardNumber = $detailsArray['accountNumber'] ?? null;
+        if (!$cardNumber)
+        {
+            return [
+                'success' => false,
+                'error' => 'Could not determine the card number from the original transaction.',
+            ];
+        }
+
+        // Build the refund request
+        $creditCard = new AnetAPI\CreditCardType();
+        $creditCard->setCardNumber($cardNumber);
+        $creditCard->setExpirationDate('XXXX');
+
+        $payment = new AnetAPI\PaymentType();
+        $payment->setCreditCard($creditCard);
+
+        $transactionRequest = new AnetAPI\TransactionRequestType();
+        $transactionRequest->setTransactionType('refundTransaction');
+        $transactionRequest->setAmount($amount);
+        $transactionRequest->setPayment($payment);
+        $transactionRequest->setRefTransId($transId);
+
+        $request = new AnetAPI\CreateTransactionRequest();
+        $request->setMerchantAuthentication(self::newMerchantAuthentication($paymentProfile));
+        $request->setTransactionRequest($transactionRequest);
+
+        $controller = new AnetController\CreateTransactionController($request);
+
+        try
+        {
+            /** @var AnetAPI\CreateTransactionResponse $apiResponse */
+            $apiResponse = self::chooseEndpointAndExecute($controller);
+
+            if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK)
+            {
+                $transactionResponse = $apiResponse->getTransactionResponse();
+                if ($transactionResponse && $transactionResponse->getResponseCode() == self::RESPONSE_CODE_TRANSACTION_APPROVED)
+                {
+                    return [
+                        'success' => true,
+                        'provider_refund_id' => $transactionResponse->getTransId(),
+                    ];
+                }
+
+                // Transaction not approved
+                $errors = [];
+                if ($transactionResponse && $transactionResponse->getErrors())
+                {
+                    foreach ($transactionResponse->getErrors() as $error)
+                    {
+                        $errors[] = $error->getErrorText();
+                    }
+                }
+
+                return [
+                    'success' => false,
+                    'error' => $errors ? implode(', ', $errors) : 'Refund transaction was not approved.',
+                ];
+            }
+            else
+            {
+                $messages = [];
+                foreach ($apiResponse->getMessages()->getMessage() as $message)
+                {
+                    $messages[] = $message->getText();
+                }
+
+                return [
+                    'success' => false,
+                    'error' => implode(', ', $messages),
+                ];
+            }
+        }
+        catch (\Exception $e)
+        {
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+            ];
         }
     }
 
@@ -530,5 +664,38 @@ class Sdk
         $merchantAuthentication->setTransactionKey($paymentProfile->options['transaction_key']);
 
         return $merchantAuthentication;
+    }
+
+    /**
+     * Get customer IP address formatted for Authorize.Net API.
+     * Authorize.Net limits customerIp to 15 characters (IPv4 only),
+     * so IPv6 addresses cannot be used and will return null.
+     *
+     * @return string|null Returns IPv4 address or null if IPv6/unavailable
+     */
+    private static function getIpAddressForAuthorizeNet()
+    {
+        $ip = \XF::app()->request()->getIp();
+
+        if (empty($ip)) {
+            return null;
+        }
+
+        // Check if it's already a valid IPv4 (max 15 chars: 255.255.255.255)
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return $ip;
+        }
+
+        // Check for IPv6-mapped IPv4 addresses (e.g., ::ffff:192.168.1.1)
+        if (preg_match('/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i', $ip, $matches)) {
+            $extractedIp = $matches[1];
+            if (filter_var($extractedIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                return $extractedIp;
+            }
+        }
+
+        // Pure IPv6 address - cannot be used with Authorize.Net's 15-char limit
+        // Return null to skip setting the customer IP (field is optional)
+        return null;
     }
 }

@@ -20,9 +20,9 @@
             'dev_requirement' => false,
         ),
         'authorizenet/authorizenet' => array(
-            'pretty_version' => '2.0.3',
-            'version' => '2.0.3.0',
-            'reference' => 'e1acf55c9cb22bef1852b1e494502973ade11cce',
+            'pretty_version' => '2.0.4',
+            'version' => '2.0.4.0',
+            'reference' => '8555cc245953dd0ac57f7ea424a5572eae4c7191',
             'type' => 'library',
             'install_path' => __DIR__ . '/../authorizenet/authorizenet',
             'aliases' => array(),
