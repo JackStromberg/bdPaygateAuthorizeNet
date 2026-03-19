@@ -8,7 +8,7 @@ use XF\Entity\PurchaseRequest;
 use XF\Entity\UserUpgradeActive;
 use XF\Finder\PaymentProfileFinder;
 use XF\Finder\PaymentProviderLogFinder;
-use XF\Finder\UserUpgradeActiveFinder;
+use XF\Finder\PurchaseRequestFinder;
 use XF\Mvc\Controller;
 use XF\Payment\AbstractProvider;
 use XF\Payment\CallbackState;
@@ -136,56 +136,32 @@ class Provider extends AbstractProvider
         PurchaseRequest $purchaseRequest,
         PaymentProfile $paymentProfile
     ) {
-        $subscriptionId = null;
-    
-        // 1. Try finding ID in the Logs
-        $logFinder = \XF::finder(PaymentProviderLogFinder::class)
-            ->where('purchase_request_key', $purchaseRequest->request_key)
-            ->where('provider_id', $this->getProviderId())
-            ->order('log_date', 'desc');
+        $subscriptionId = $this->getSubscriberIdFromPurchaseRequest($purchaseRequest);
 
-        $logs = $logFinder->fetch();
-        foreach ($logs as $log) {
-            if ($log->subscriber_id) {
-                $subscriptionId = $log->subscriber_id;
-                break;
-            }
-        }
-    
-        // 2. FALLBACK: Check Active Upgrade record
         if (!$subscriptionId) {
-            $activeUpgrade = \XF::finder(UserUpgradeActiveFinder::class)
-                ->where('purchase_request_key', $purchaseRequest->request_key)
-                ->fetchOne();
-        
-            if ($activeUpgrade && !empty($activeUpgrade->extra['subscriber_id'])) {
-                $subscriptionId = $activeUpgrade->extra['subscriber_id'];
-            }
+            return $controller->error(\XF::phrase('could_not_find_subscriber_id_for_this_purchase_request'));
         }
-    
-        // 3. If still missing, cannot cancel
-        if (!$subscriptionId) {
-            return $controller->error('Could not find a subscriber ID to cancel.');
-        }
-    
-        // 4. Cancel at Authorize.Net
-        $unSubscribed = false;
+
         try {
             $unSubscribed = Sdk::unSubscribe($paymentProfile, $subscriptionId);
         } catch (\Exception $e) {
             \XF::logException($e);
-            return $controller->error('Authorize.Net API Error: ' . $e->getMessage());
+            throw $controller->exception($controller->error(
+                \XF::phrase('this_subscription_cannot_be_cancelled_maybe_already_cancelled')
+            ));
         }
-    
+
         if (!$unSubscribed) {
             throw $controller->exception($controller->error(
                 \XF::phrase('this_subscription_cannot_be_cancelled_maybe_already_cancelled')
             ));
         }
-    
-        // 5. Use XenForo's standard handler (proper way)
-        $purchaseRequest->Purchasable->handler->processCancellation($purchaseRequest);
-    
+
+        $purchasable = $purchaseRequest->Purchasable;
+        if ($purchasable && $purchasable->handler) {
+            $purchasable->handler->processCancellation($purchaseRequest);
+        }
+
         return $controller->redirect(
             $controller->getDynamicRedirect(),
             \XF::phrase('Xfrocks_AuthorizeNetArb_subscription_cancelled_successfully')
@@ -312,6 +288,11 @@ class Provider extends AbstractProvider
                 $subscribeLogDetails,
                 $subscribeLogSubId
             );
+
+            if ($subscribeLogSubId) {
+                $purchaseRequest->provider_metadata = json_encode(['subscription' => $subscribeLogSubId]);
+                $purchaseRequest->save();
+            }
         }
         // Log the charge with the subscriber ID
         $paymentRepo->logCallback(
@@ -458,13 +439,21 @@ class Provider extends AbstractProvider
                 if ($subscriptionId != null) {
                     $state->subscriberId = $subscriptionId;
 
-                    /** @var PaymentProviderLog|null $providerLog */
-                    $providerLog = \XF::em()->findOne(PaymentProviderLog::class, [
-                        'subscriber_id' => $subscriptionId,
-                        'provider_id' => $this->getProviderId()
+                    // Try provider_metadata first (preferred), then fall back to logs
+                    $purchaseRequest = $this->findPurchaseRequestByMetadata([
+                        'subscription' => $subscriptionId,
                     ]);
-                    if ($providerLog !== null) {
-                        $state->requestKey = $providerLog->purchase_request_key;
+                    if ($purchaseRequest) {
+                        $state->requestKey = $purchaseRequest->request_key;
+                    } else {
+                        /** @var PaymentProviderLog|null $providerLog */
+                        $providerLog = \XF::em()->findOne(PaymentProviderLog::class, [
+                            'subscriber_id' => $subscriptionId,
+                            'provider_id' => $this->getProviderId()
+                        ]);
+                        if ($providerLog !== null) {
+                            $state->requestKey = $providerLog->purchase_request_key;
+                        }
                     }
                 }
 
@@ -536,6 +525,19 @@ class Provider extends AbstractProvider
             $state->httpCode = 200;
 
             return false;
+        }
+
+        // Sync subscription ID to provider_metadata for future lookups
+        // (also backfills metadata for subscriptions created before this was added)
+        $purchaseRequest = $state->getPurchaseRequest();
+        if ($purchaseRequest && $state->subscriberId) {
+            $existing = $this->getProviderMetadata($purchaseRequest);
+            if (!isset($existing['subscription'])) {
+                $existing['subscription'] = $state->subscriberId;
+                ksort($existing);
+                $purchaseRequest->provider_metadata = json_encode($existing);
+                $purchaseRequest->save();
+            }
         }
 
         return true;
@@ -619,36 +621,6 @@ class Provider extends AbstractProvider
 
         return parent::verifyConfig($options, $errors);
     }
-    public function completeTransaction(CallbackState $state)
-    {
-        parent::completeTransaction($state);
-
-        // Inject Subscriber ID into upgrade record's 'extra' field
-        if ($state->subscriberId && $state->requestKey) {
-            $upgrade = \XF::finder(UserUpgradeActiveFinder::class)
-                ->where('purchase_request_key', $state->requestKey)
-                ->fetchOne();
-
-            if ($upgrade) {
-                // Get existing extra data or initialize empty array
-                $extra = $upgrade->extra ?: [];
-                
-                // Add the missing Subscriber ID
-                $extra['subscriber_id'] = $state->subscriberId;
-
-                // Add payment_profile_id if available
-                if ($state->paymentProfile) {
-                    $extra['payment_profile_id'] = $state->paymentProfile->payment_profile_id;
-                }
-
-                // Save back to the entity (XF handles the JSON encoding)
-                $upgrade->extra = $extra;
-                $upgrade->save();
-            }
-        }
-
-    }
-
     /**
      * VISIBILITY FIX: This forces the Cancel button to render using the default template.
      */
@@ -712,6 +684,58 @@ class Provider extends AbstractProvider
         }
 
         return Sdk::refund($paymentProfile, $actualTransId, $amount);
+    }
+
+    protected function getProviderMetadata(PurchaseRequest $purchaseRequest): array
+    {
+        $providerMetadata = json_decode($purchaseRequest->provider_metadata ?? '[]', true);
+        if (is_array($providerMetadata)) {
+            return $providerMetadata;
+        }
+        return [];
+    }
+
+    protected function findPurchaseRequestByMetadata(array $identifiers): ?PurchaseRequest
+    {
+        foreach ($identifiers as $key => $value) {
+            if (!$value) {
+                continue;
+            }
+
+            $purchaseRequestFinder = \XF::finder(PurchaseRequestFinder::class);
+            $purchaseRequestFinder
+                ->where('provider_metadata', 'LIKE', $purchaseRequestFinder->escapeLike(
+                    '"' . $key . '":"' . $value . '"',
+                    '%?%'
+                ));
+
+            $purchaseRequest = $purchaseRequestFinder->fetchOne();
+            if ($purchaseRequest) {
+                return $purchaseRequest;
+            }
+        }
+
+        return null;
+    }
+
+    protected function getSubscriberIdFromPurchaseRequest(PurchaseRequest $purchaseRequest): ?string
+    {
+        $providerMetadata = $this->getProviderMetadata($purchaseRequest);
+
+        if (isset($providerMetadata['subscription'])) {
+            return $providerMetadata['subscription'];
+        }
+
+        // Fallback: search logs (for subscriptions created before provider_metadata was used)
+        $logFinder = \XF::finder(PaymentProviderLogFinder::class)
+            ->where('purchase_request_key', $purchaseRequest->request_key)
+            ->where('provider_id', $this->providerId)
+            ->where('subscriber_id', '!=', null)
+            ->order('log_date', 'desc');
+
+        $log = $logFinder->fetchOne();
+
+        return $log->subscriber_id ?? null;
     }
 
     /**
