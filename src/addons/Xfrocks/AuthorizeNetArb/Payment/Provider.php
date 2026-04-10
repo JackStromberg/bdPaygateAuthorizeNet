@@ -340,6 +340,12 @@ class Provider extends AbstractProvider
 
         /** @noinspection PhpUndefinedFieldInspection */
         $state->inputRaw = $inputRaw = $request->getInputRaw();
+
+        if ($inputRaw === '' || $inputRaw === null) {
+            $state->httpCode = 200;
+            return $state;
+        }
+
         $input = @json_decode($inputRaw, true);
         $filtered = \XF::app()->inputFilterer()->filterArray(is_array($input) ? $input : [], [
             'eventType' => 'str',
@@ -359,7 +365,24 @@ class Provider extends AbstractProvider
                     $state->authAmount = $filtered['payload']['authAmount'];
                 }
 
-                $state->transactionId = $filtered['payload']['id'];
+                if (isset($filtered['payload']['id'])) {
+                    $state->transactionId = $filtered['payload']['id'];
+                } elseif (isset($filtered['payload']['responseCode']) && $filtered['payload']['responseCode'] == 0) {
+                    $invoiceNum = $filtered['payload']['invoiceNumber'] ?? 'N/A';
+                    $authAmt = $filtered['payload']['authAmount'] ?? 'N/A';
+                    $state->logType = 'info';
+                    $state->logMessage = sprintf(
+                        'Failed charge attempt (responseCode 0): invoice #%s, amount %s, event %s',
+                        $invoiceNum,
+                        $authAmt,
+                        $filtered['eventType'] ?: 'unknown'
+                    );
+                    $state->httpCode = 200;
+                } else {
+                    $state->logType = 'error';
+                    $state->logMessage = 'Webhook received for transaction with no ID and unexpected responseCode. Raw: ' . $inputRaw;
+                    $state->httpCode = 200;
+                }
                 break;
         }
 
@@ -383,6 +406,10 @@ class Provider extends AbstractProvider
      */
     public function validateCallback(CallbackState $state)
     {
+        if ($state->logType || $state->inputRaw === '' || $state->inputRaw === null) {
+            return false;
+        }
+
         /** @var PaymentRepository $paymentRepo */
         $paymentRepo = \XF::repository(PaymentRepository::class);
 
