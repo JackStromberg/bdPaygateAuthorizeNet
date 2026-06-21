@@ -19,6 +19,15 @@ use Xfrocks\AuthorizeNetArb\Util\Sdk;
 class Provider extends AbstractProvider
 {
     /**
+     * Currencies Authorize.Net can process, per its processor-support matrix
+     * (https://developer.authorize.net/api/reference/features/processor-support.html).
+     * An Authorize.Net account settles in exactly one of these; which one is
+     * active is chosen per payment profile via the currency option, and read
+     * back through Sdk::getCurrency().
+     */
+    public const SUPPORTED_CURRENCIES = ['USD', 'CAD', 'GBP', 'EUR', 'AUD', 'NZD'];
+
+    /**
      * @return string
      */
     public function getCallbackUrl()
@@ -90,7 +99,7 @@ class Provider extends AbstractProvider
         }
 
         $viewParams = [
-            'enableLivePayments' => !!\XF::config('enableLivePayments'),
+            'enableLivePayments' => Sdk::isLive($purchase->paymentProfile),
             'purchaseRequest' => $purchaseRequest,
             'paymentProfile' => $purchase->paymentProfile,
             'purchaser' => $purchase->purchaser,
@@ -197,6 +206,9 @@ class Provider extends AbstractProvider
         if (isset($ppOptions['require_email']) && !!$ppOptions['require_email']) {
             $inputFilters['email'] = 'str';
         }
+        if (isset($ppOptions['require_phone_number']) && !!$ppOptions['require_phone_number']) {
+            $inputFilters['phone_number'] = 'str';
+        }
         if (isset($ppOptions['require_address']) && !!$ppOptions['require_address']) {
             $inputFilters['address'] = 'str';
             $inputFilters['city'] = 'str';
@@ -252,7 +264,7 @@ class Provider extends AbstractProvider
         }
         /** @var Sdk\ChargeResult $chargeResultOk */
         $chargeResultOk = $chargeResult;
-        $subscribeLogSubId = null; // Initialize variable
+        $subscribeLogSubId = null;
 
         if ($purchase->recurring) {
             $subscribeLogType = 'error';
@@ -302,7 +314,7 @@ class Provider extends AbstractProvider
             $chargeLogType,
             'Authorize.Net charge ' . $chargeLogType,
             ['charge' => $chargeResult->toArray()],
-            $subscribeLogSubId // <--- Passes the ID to the upgrade record
+            $subscribeLogSubId
         );
         return $controller->redirect($purchase->returnUrl);
     }
@@ -332,11 +344,10 @@ class Provider extends AbstractProvider
     {
         $state = new CallbackState();
 
-        $headerXAnetSignatureKey = 'X-ANET-Signature';
-        $headerXAnetSignatureKey = str_replace('-', '_', $headerXAnetSignatureKey);
-        $headerXAnetSignatureKey = strtoupper($headerXAnetSignatureKey);
+        // Authorize.Net sends the webhook HMAC in the X-ANET-Signature header,
+        // which PHP exposes as $_SERVER['HTTP_X_ANET_SIGNATURE'].
         /** @noinspection PhpUndefinedFieldInspection */
-        $state->headerXAnetSignature = $request->getServer('HTTP_' . $headerXAnetSignatureKey);
+        $state->headerXAnetSignature = $request->getServer('HTTP_X_ANET_SIGNATURE');
 
         /** @noinspection PhpUndefinedFieldInspection */
         $state->inputRaw = $inputRaw = $request->getInputRaw();
@@ -396,7 +407,7 @@ class Provider extends AbstractProvider
      */
     public function verifyCurrency(PaymentProfile $paymentProfile, $currencyCode)
     {
-        return $currencyCode === 'USD';
+        return $currencyCode === Sdk::getCurrency($paymentProfile);
     }
 
     /**
@@ -522,9 +533,8 @@ class Provider extends AbstractProvider
             }
         }
 
-        // --- START FIX: Recovery of Missing Subscriber ID ---
-        // If Authorize.Net webhook didn't include the Subscription ID,
-        // retrieve it from our logs saved during initial checkout.
+        // If the Authorize.Net webhook didn't include the subscription ID,
+        // recover it from the logs saved during the initial checkout.
         if (!$state->subscriberId) {
             // Get request key from state or fallback to purchase request
             $requestKey = $state->requestKey ?: ($state->purchaseRequest ? $state->purchaseRequest->request_key : null);
@@ -542,7 +552,6 @@ class Provider extends AbstractProvider
                 }
             }
         }
-        // --- END FIX ---
 
         if (!$state->getPurchaseRequest()) {
             $state->logType = 'error';
@@ -615,6 +624,18 @@ class Provider extends AbstractProvider
             $errors = [];
         }
 
+        // Normalise the configured currency: fall back to USD if it is missing or
+        // is not one of the currencies Authorize.Net can process.
+        if (!isset($options['currency']) || !in_array($options['currency'], self::SUPPORTED_CURRENCIES, true)) {
+            $options['currency'] = 'USD';
+        }
+
+        // Normalise the environment: anything other than an explicit "production"
+        // selection falls back to the safe sandbox default.
+        if (!isset($options['environment']) || !in_array($options['environment'], ['sandbox', 'production'], true)) {
+            $options['environment'] = 'sandbox';
+        }
+
         $requiredOptionKeys = [
             'api_login_id',
             'transaction_key',
@@ -633,7 +654,12 @@ class Provider extends AbstractProvider
         }
 
         try {
-            Sdk::assertWebhookExists($options['api_login_id'], $options['transaction_key'], $this->getCallbackUrl());
+            Sdk::assertWebhookExists(
+                $options['api_login_id'],
+                $options['transaction_key'],
+                $this->getCallbackUrl(),
+                $options['environment'] === 'production'
+            );
         } catch (\Exception $e) {
             \XF::logException($e);
 
@@ -649,7 +675,7 @@ class Provider extends AbstractProvider
         return parent::verifyConfig($options, $errors);
     }
     /**
-     * VISIBILITY FIX: This forces the Cancel button to render using the default template.
+     * Render the cancellation control using XenForo's default template.
      */
     public function renderCancellationTemplate(PurchaseRequest $purchaseRequest)
     {
@@ -673,7 +699,7 @@ class Provider extends AbstractProvider
      * @param PurchaseRequest $purchaseRequest The original purchase request
      * @param string $transactionId The Authorize.Net transaction ID to refund
      * @param float|null $amount Refund amount (null = full refund)
-     * @param string $currency Currency code (only USD supported)
+     * @param string $currency Currency code (must match the profile's configured currency)
      * @return array{success: bool, provider_refund_id?: string, error?: string}
      */
     public function refund(
@@ -682,13 +708,12 @@ class Provider extends AbstractProvider
         string $transactionId,
         ?float $amount = null,
         string $currency = 'USD'
-    ): array
-    {
-        if ($currency !== 'USD')
-        {
+    ): array {
+        $profileCurrency = Sdk::getCurrency($paymentProfile);
+        if ($currency !== $profileCurrency) {
             return [
                 'success' => false,
-                'error' => 'Authorize.Net only supports USD refunds.',
+                'error' => sprintf('This payment profile only supports %s refunds.', $profileCurrency),
             ];
         }
 
@@ -696,8 +721,7 @@ class Provider extends AbstractProvider
         // The transactionId passed in is the event ID from the webhook log,
         // but we need the actual Authorize.Net transaction ID.
         $actualTransId = $this->resolveTransactionId($purchaseRequest, $transactionId);
-        if (!$actualTransId)
-        {
+        if (!$actualTransId) {
             return [
                 'success' => false,
                 'error' => 'Could not determine the Authorize.Net transaction ID.',
@@ -705,8 +729,7 @@ class Provider extends AbstractProvider
         }
 
         // If no amount specified, use the full purchase cost
-        if ($amount === null)
-        {
+        if ($amount === null) {
             $amount = (float) $purchaseRequest->cost_amount;
         }
 
@@ -756,7 +779,7 @@ class Provider extends AbstractProvider
         // Fallback: search logs (for subscriptions created before provider_metadata was used)
         $logFinder = \XF::finder(PaymentProviderLogFinder::class)
             ->where('purchase_request_key', $purchaseRequest->request_key)
-            ->where('provider_id', $this->providerId)
+            ->where('provider_id', $this->getProviderId())
             ->where('subscriber_id', '!=', null)
             ->order('log_date', 'desc');
 
@@ -766,31 +789,27 @@ class Provider extends AbstractProvider
     }
 
     /**
-     * Resolve the actual Authorize.Net transaction ID from logs.
-     * The charge log stores the real transaction ID in log_details.
+     * Resolve the actual Authorize.Net transaction ID.
+     *
+     * If a numeric ID was passed in it is already the transaction ID. Otherwise
+     * fall back to the charge log, where logCallback() recorded the real
+     * transaction ID in the dedicated transaction_id column.
      */
     protected function resolveTransactionId(PurchaseRequest $purchaseRequest, string $transactionId): ?string
     {
-        // The transactionId on the log entry might already be the Authorize.Net transaction ID
-        // Check if it looks like a numeric Authorize.Net transaction ID
-        if (is_numeric($transactionId))
-        {
+        if (is_numeric($transactionId)) {
             return $transactionId;
         }
 
-        // Fall back to searching the payment log for the charge transaction ID
         $logFinder = \XF::finder(PaymentProviderLogFinder::class)
             ->where('purchase_request_key', $purchaseRequest->request_key)
             ->where('provider_id', $this->getProviderId())
             ->where('log_type', 'info')
             ->order('log_date', 'DESC');
 
-        foreach ($logFinder->fetch() as $log)
-        {
-            $details = $log->log_details;
-            if (isset($details['charge']['_transId']))
-            {
-                return $details['charge']['_transId'];
+        foreach ($logFinder->fetch() as $log) {
+            if ($log->transaction_id) {
+                return $log->transaction_id;
             }
         }
 
