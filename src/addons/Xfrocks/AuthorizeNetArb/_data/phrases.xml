@@ -20,7 +20,13 @@
   <phrase title="Xfrocks_AuthorizeNetArb_credit_card_not_accepted" version_id="1000000" version_string="1.0.0"><![CDATA[{friendlyCardType} is not accepted.]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_credit_card_unsupported" version_id="1000000" version_string="1.0.0"><![CDATA[The specified credit card]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_credit_card_visa" version_id="1000000" version_string="1.0.0"><![CDATA[Visa]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_currency" version_id="1050500" version_string="1.5.5"><![CDATA[Currency]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_currency_explain" version_id="1050500" version_string="1.5.5"><![CDATA[The currency this payment profile processes in. Authorize.Net settles each account in a single currency, so this <b>must match the currency configured for your Authorize.Net merchant account / payment processor</b> &mdash; selecting a currency your account does not support will cause transactions to be declined. Only currencies Authorize.Net can process are listed.]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_display_credit_cards" version_id="1000000" version_string="1.0.0"><![CDATA[These check boxes show the credit cards of the provider cards you accept (this is cosmetic and does not affect processing).]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_environment" version_id="1050500" version_string="1.5.5"><![CDATA[Environment]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_environment_explain" version_id="1050500" version_string="1.5.5"><![CDATA[Which Authorize.Net environment this payment profile connects to. Choose <b>Sandbox</b> for testing with sandbox.authorize.net credentials, or <b>Production</b> for live payments with your real merchant credentials. This must match the credentials entered above.]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_environment_production" version_id="1050500" version_string="1.5.5"><![CDATA[Production (live payments)]]></phrase>
+  <phrase title="Xfrocks_AuthorizeNetArb_environment_sandbox" version_id="1050500" version_string="1.5.5"><![CDATA[Sandbox (testing)]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_expiration_date" version_id="1000000" version_string="1.0.0"><![CDATA[Expiration Date]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_first_name" version_id="1000000" version_string="1.0.0"><![CDATA[First Name]]></phrase>
   <phrase title="Xfrocks_AuthorizeNetArb_full_name" version_id="1000000" version_string="1.0.0"><![CDATA[Full Name]]></phrase>

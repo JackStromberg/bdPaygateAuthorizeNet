@@ -50,6 +50,75 @@ class GetTransactionDetailsResult extends BaseResult
     }
 
     /**
+     * Authorize.Net settlement status, e.g. 'settledSuccessfully',
+     * 'capturedPendingSettlement'. Used to decide refund vs. void.
+     *
+     * @return string|null
+     */
+    public function getTransactionStatus()
+    {
+        $transaction = $this->getTransaction();
+        if ($transaction === null) {
+            return null;
+        }
+
+        return $transaction->getTransactionStatus();
+    }
+
+    /**
+     * The amount of the original transaction. Prefers the settled amount, falling
+     * back to the authorized amount for transactions that have not settled yet.
+     *
+     * @return float|null
+     */
+    public function getTransactionAmount()
+    {
+        $transaction = $this->getTransaction();
+        if ($transaction === null) {
+            return null;
+        }
+
+        $settleAmount = $transaction->getSettleAmount();
+        if ($settleAmount !== null && $settleAmount !== '') {
+            return (float) $settleAmount;
+        }
+
+        $authAmount = $transaction->getAuthAmount();
+        if ($authAmount !== null && $authAmount !== '') {
+            return (float) $authAmount;
+        }
+
+        return null;
+    }
+
+    /**
+     * The masked card number of the original transaction (e.g. "XXXX1111").
+     * Authorize.Net requires this for a linked (settled) refund. Returns null for
+     * non credit-card payments (e.g. eCheck) or if the details are unavailable.
+     *
+     * @return string|null
+     */
+    public function getMaskedCardNumber()
+    {
+        $transaction = $this->getTransaction();
+        if ($transaction === null) {
+            return null;
+        }
+
+        $payment = $transaction->getPayment();
+        if ($payment === null) {
+            return null;
+        }
+
+        $creditCard = $payment->getCreditCard();
+        if ($creditCard === null) {
+            return null;
+        }
+
+        return $creditCard->getCardNumber();
+    }
+
+    /**
      * @return int|null
      */
     public function getSubscriptionId()

@@ -34,4 +34,30 @@ class Setup extends AbstractSetup
 
         $provider->save();
     }
+
+    /**
+     * Migrate the legacy global \XF::config('enableLivePayments') flag into a
+     * per-payment-profile "environment" option. Each existing Authorize.Net
+     * profile inherits whatever the global flag currently resolves to, so live
+     * sites stay live and test sites stay in the sandbox after the upgrade.
+     */
+    public function upgrade1050500Step1()
+    {
+        $environment = \XF::config('enableLivePayments') ? 'production' : 'sandbox';
+
+        /** @var Finder $finder */
+        $finder = $this->app->finder('XF:PaymentProfile');
+        $profiles = $finder->where('provider_id', 'authorizenet')->fetch();
+
+        foreach ($profiles as $profile) {
+            $options = $profile->options;
+            if (isset($options['environment'])) {
+                continue;
+            }
+
+            $options['environment'] = $environment;
+            $profile->options = $options;
+            $profile->save();
+        }
+    }
 }

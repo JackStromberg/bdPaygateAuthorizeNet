@@ -20,27 +20,48 @@ use Xfrocks\AuthorizeNetArb\Util\Sdk\SubscribeResult;
 
 class Sdk
 {
-    const RESPONSE_CODE_TRANSACTION_APPROVED = '1';
-    const RESPONSE_OK = 'Ok';
+    public const RESPONSE_CODE_TRANSACTION_APPROVED = '1';
+    public const RESPONSE_OK = 'Ok';
 
-    const SUBSCRIBE_MAX_ATTEMPTS = 3;
+    public const SUBSCRIBE_MAX_ATTEMPTS = 3;
 
-    const WEBHOOK_EVENT_TYPE_AUTH_AND_CAPTURE = 'net.authorize.payment.authcapture.created';
-    const WEBHOOK_EVENT_TYPE_REFUND = 'net.authorize.payment.refund.created';
-    const WEBHOOK_EVENT_TYPE_VOID = 'net.authorize.payment.void.created';
+    public const WEBHOOK_EVENT_TYPE_AUTH_AND_CAPTURE = 'net.authorize.payment.authcapture.created';
+    public const WEBHOOK_EVENT_TYPE_REFUND = 'net.authorize.payment.refund.created';
+    public const WEBHOOK_EVENT_TYPE_VOID = 'net.authorize.payment.void.created';
+
+    /**
+     * Transaction statuses that have completed settlement and can therefore be
+     * refunded directly (including partial refunds).
+     */
+    public const REFUNDABLE_STATUSES = ['settledSuccessfully'];
+
+    /**
+     * Transaction statuses that are still awaiting the daily settlement batch.
+     * Authorize.Net cannot refund these — they must be voided instead, and a
+     * void can only reverse the full amount, never a partial.
+     */
+    public const VOIDABLE_STATUSES = [
+        'authorizedPendingCapture',
+        'capturedPendingSettlement',
+        'FDSPendingReview',
+        'FDSAuthorizedPendingReview',
+        'underReview',
+        'approvedReview',
+    ];
 
     /**
      * @param string $apiLoginId
      * @param string $transactionKey
      * @param string $callbackUrl
+     * @param bool $live
      * @return void
      * @throws \Exception
      */
-    public static function assertWebhookExists($apiLoginId, $transactionKey, $callbackUrl)
+    public static function assertWebhookExists($apiLoginId, $transactionKey, $callbackUrl, $live)
     {
         self::autoload();
 
-        $url = self::getEndpoint() . '/rest/v1/webhooks';
+        $url = self::getEndpoint($live) . '/rest/v1/webhooks';
         $eventTypes = [
             self::WEBHOOK_EVENT_TYPE_AUTH_AND_CAPTURE,
             self::WEBHOOK_EVENT_TYPE_REFUND,
@@ -85,7 +106,7 @@ class Sdk
                 throw new \Exception('Webhook cannot be created');
             }
         } else {
-            $updateUrl = self::getEndpoint() . $existingWebhook['_links']['self']['href'];
+            $updateUrl = self::getEndpoint($live) . $existingWebhook['_links']['self']['href'];
             $updatedWebhook = self::createHttpRequestAndSend($apiLoginId, $transactionKey, $updateUrl, 'PUT', $json);
             if (!is_array($updatedWebhook) || !isset($updatedWebhook['webhookId'])) {
                 throw new \Exception('Webhook cannot be updated');
@@ -122,7 +143,7 @@ class Sdk
             $customerAddress->setLastName('Appleseed');
             $customerAddressHasData = true;
         }
-        if(isset($inputs['phone_number'])){
+        if (isset($inputs['phone_number'])) {
             $customerAddress->setPhoneNumber($inputs['phone_number']);
             $customerAddressHasData = true;
         }
@@ -149,7 +170,7 @@ class Sdk
 
         $order = new AnetAPI\OrderType();
         $order->setInvoiceNumber(strval($purchaseRequest->purchase_request_id));
-        $order->setDescription($purchase->title);
+        $order->setDescription(self::sanitizeDescription($purchase->title));
 
         $opaqueDataArray = @json_decode($opaqueDataJson, true);
         if (!is_array($opaqueDataArray)) {
@@ -164,9 +185,7 @@ class Sdk
 
         $transactionRequest = new AnetAPI\TransactionRequestType();
         $transactionRequest->setAmount($purchase->cost);
-        if ($purchase->currency !== 'USD') {
-            throw new \InvalidArgumentException('Currency is not supported ' . $purchase->currency);
-        }
+        self::assertCurrency($paymentProfile, $purchase);
         if ($customerAddressHasData) {
             $transactionRequest->setBillTo($customerAddress);
         }
@@ -189,7 +208,7 @@ class Sdk
         $controller = new AnetController\CreateTransactionController($request);
 
         /** @var AnetAPI\CreateTransactionResponse $apiResponse */
-        $apiResponse = self::chooseEndpointAndExecute($controller);
+        $apiResponse = self::chooseEndpointAndExecute($controller, self::isLive($paymentProfile));
 
         if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK) {
             return new ChargeResult($apiResponse);
@@ -206,14 +225,15 @@ class Sdk
      */
     public static function createCustomerProfileFromTransaction($paymentProfile, $chargeOk)
     {
-        // --- START FIX: Authorize.Net SDK 2.0.2 Bug Workaround ---
+        // Work around an Authorize.Net SDK 2.0.2 bug where the
+        // CreateCustomerProfileFromTransactionResponse class is missing: alias it to
+        // CreateCustomerProfileResponse so the SDK can resolve the response type.
         if (!class_exists('net\authorize\api\contract\v1\CreateCustomerProfileFromTransactionResponse')) {
             class_alias(
                 'net\authorize\api\contract\v1\CreateCustomerProfileResponse',
                 'net\authorize\api\contract\v1\CreateCustomerProfileFromTransactionResponse'
             );
         }
-        // --- END FIX ---
         self::autoload();
 
         $transId = $chargeOk->getTransId();
@@ -232,7 +252,7 @@ class Sdk
         $controller = new AnetController\CreateCustomerProfileFromTransactionController($request);
 
         /** @var AnetApi\CreateCustomerProfileResponse $apiResponse */
-        $apiResponse = self::chooseEndpointAndExecute($controller);
+        $apiResponse = self::chooseEndpointAndExecute($controller, self::isLive($paymentProfile));
 
         if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK) {
             return new CreateCustomerProfileResult($apiResponse);
@@ -258,7 +278,7 @@ class Sdk
         $controller = new AnetController\GetTransactionDetailsController($request);
 
         /** @var AnetApi\CreateCustomerProfileResponse $apiResponse */
-        $apiResponse = self::chooseEndpointAndExecute($controller);
+        $apiResponse = self::chooseEndpointAndExecute($controller, self::isLive($paymentProfile));
 
         if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK) {
             return new GetTransactionDetailsResult($apiResponse);
@@ -279,24 +299,20 @@ class Sdk
     {
         self::autoload();
 
-        // --- START WAIT LOGIC ---
-        // Wait before first attempt to ensure Customer Profile is ready
-        if ($attemptId === 0) {
-            $enableLivePayments = \XF::config('enableLivePayments');
-            // Sandbox needs extra time for profile propagation
-            if (!$enableLivePayments) {
-                sleep(15);
-            }
-        }
-        // --- END WAIT LOGIC ---
-
-        self::assertRecurringLength($purchase->lengthAmount, $purchase->lengthUnit);
-
-        $enableLivePayments = !!\XF::config('enableLivePayments');
         $paymentProfile = $purchaseRequest->PaymentProfile;
         if ($paymentProfile === null) {
             throw new \InvalidArgumentException('Payment profile is missing');
         }
+
+        $live = self::isLive($paymentProfile);
+
+        // Wait before the first attempt to ensure the Customer Profile is ready.
+        // The sandbox needs extra time for profile propagation; live is ready sooner.
+        if ($attemptId === 0 && !$live) {
+            sleep(15);
+        }
+
+        self::assertRecurringLength($purchase->lengthAmount, $purchase->lengthUnit);
 
         $order = new AnetAPI\OrderType();
         $invoiceNumber = strval($purchaseRequest->purchase_request_id);
@@ -304,14 +320,14 @@ class Sdk
             $invoiceNumber .= sprintf(':%d', $attemptId);
         }
         $order->setInvoiceNumber($invoiceNumber);
-        $order->setDescription($purchase->title);
+        $order->setDescription(self::sanitizeDescription($purchase->title));
 
         $interval = new AnetAPI\PaymentScheduleType\IntervalAType();
         $interval->setLength($purchase->lengthAmount);
         $interval->setUnit($purchase->lengthUnit . 's');
 
         $startDate = new \DateTime();
-        if ($enableLivePayments) {
+        if ($live) {
             $startDate->add(new \DateInterval(sprintf(
                 'P%d%s',
                 $purchase->lengthAmount,
@@ -333,9 +349,7 @@ class Sdk
 
         $subscription = new AnetAPI\ARBSubscriptionType();
         $subscription->setAmount($purchase->cost);
-        if ($purchase->currency !== 'USD') {
-            throw new \InvalidArgumentException('Currency is not supported ' . $purchase->currency);
-        }
+        self::assertCurrency($paymentProfile, $purchase);
         $subscription->setOrder($order);
         $subscription->setPaymentSchedule($paymentSchedule);
         $subscription->setProfile($apiCustomerProfile);
@@ -347,7 +361,7 @@ class Sdk
         $controller = new AnetController\ARBCreateSubscriptionController($request);
 
         /** @var AnetAPI\ARBCreateSubscriptionResponse $apiResponse */
-        $apiResponse = self::chooseEndpointAndExecute($controller);
+        $apiResponse = self::chooseEndpointAndExecute($controller, $live);
 
         if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK) {
             return new SubscribeResult($apiResponse);
@@ -361,7 +375,7 @@ class Sdk
             }
 
             if ($shouldRetry && $attemptId < self::SUBSCRIBE_MAX_ATTEMPTS) {
-                if ($enableLivePayments) {
+                if ($live) {
                     sleep(1);
                 } else {
                     // Sandbox environment is a bit slow. Creating a new subscription immediately after
@@ -393,7 +407,7 @@ class Sdk
         $controller = new AnetController\ARBCancelSubscriptionController($request);
 
         /** @var AnetAPI\ARBCancelSubscriptionResponse $apiResponse */
-        $apiResponse = self::chooseEndpointAndExecute($controller);
+        $apiResponse = self::chooseEndpointAndExecute($controller, self::isLive($paymentProfile));
 
         if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK) {
             return true;
@@ -403,24 +417,34 @@ class Sdk
     }
 
     /**
-     * Issue a refund for a previously captured transaction.
+     * Reverse a previously captured transaction.
      *
-     * Authorize.Net refunds require the original transaction ID and the last 4 digits
-     * of the credit card. We retrieve these from the transaction details API.
+     * Authorize.Net only allows a *refund* once the original transaction has
+     * settled (settlement runs roughly once a day). Before that the transaction
+     * is still pending and must instead be *voided* — and a void can only reverse
+     * the full amount, never a partial. This method inspects the transaction's
+     * settlement status and routes to the correct operation:
+     *
+     *  - settled            -> refund (full or partial)
+     *  - pending settlement -> void, but only if this is a full reversal;
+     *                          a partial refund before settlement is rejected
+     *                          with a clear message so the admin can void the
+     *                          full amount now or refund after it settles
+     *  - anything else      -> rejected with the gateway status surfaced
      *
      * @param PaymentProfile $paymentProfile
-     * @param string $transId The original transaction ID to refund
+     * @param string $transId The original transaction ID to reverse
      * @param float $amount The refund amount
-     * @return array{success: bool, provider_refund_id?: string, error?: string}
+     * @return array{success: bool, provider_refund_id?: string, voided?: bool, error?: string}
      */
     public static function refund(PaymentProfile $paymentProfile, string $transId, float $amount): array
     {
         self::autoload();
 
-        // First, get the original transaction details to obtain card info
+        // Settlement status decides refund-vs-void; the details also carry the
+        // card number a refund needs, so we always fetch them up front.
         $transactionDetails = self::getTransactionDetails($paymentProfile, $transId);
-        if (!$transactionDetails->isOk())
-        {
+        if (!$transactionDetails->isOk()) {
             return [
                 'success' => false,
                 'error' => 'Could not retrieve original transaction details: '
@@ -428,17 +452,63 @@ class Sdk
             ];
         }
 
-        $detailsArray = $transactionDetails->toArray();
-        $cardNumber = $detailsArray['accountNumber'] ?? null;
-        if (!$cardNumber)
-        {
+        $status = $transactionDetails->getTransactionStatus();
+
+        if (in_array($status, self::REFUNDABLE_STATUSES, true)) {
+            return self::refundSettledTransaction($paymentProfile, $transId, $amount, $transactionDetails);
+        }
+
+        if (in_array($status, self::VOIDABLE_STATUSES, true)) {
+            $originalAmount = $transactionDetails->getTransactionAmount();
+            $isFullReversal = $originalAmount === null || $amount >= ($originalAmount - 0.001);
+
+            if (!$isFullReversal) {
+                return [
+                    'success' => false,
+                    'error' => sprintf(
+                        'This payment has not settled yet (status: %s). Authorize.Net cannot issue a '
+                        . 'partial refund before settlement — void the full amount now, or issue the '
+                        . 'partial refund once the transaction settles (usually within 24 hours).',
+                        $status
+                    ),
+                ];
+            }
+
+            return self::void($paymentProfile, $transId);
+        }
+
+        // voided, already refunded, declined, expired, etc. — not actionable.
+        // Surface the status instead of firing an API call we know will fail.
+        return [
+            'success' => false,
+            'error' => sprintf(
+                'This transaction cannot be refunded or voided in its current state (status: %s).',
+                $status !== null && $status !== '' ? $status : 'unknown'
+            ),
+        ];
+    }
+
+    /**
+     * Refund a settled transaction. Authorize.Net requires the original
+     * transaction ID and the last 4 digits of the card, which we read from the
+     * already-fetched transaction details.
+     *
+     * @return array{success: bool, provider_refund_id?: string, error?: string}
+     */
+    protected static function refundSettledTransaction(
+        PaymentProfile $paymentProfile,
+        string $transId,
+        float $amount,
+        GetTransactionDetailsResult $transactionDetails
+    ): array {
+        $cardNumber = $transactionDetails->getMaskedCardNumber();
+        if (!$cardNumber) {
             return [
                 'success' => false,
                 'error' => 'Could not determine the card number from the original transaction.',
             ];
         }
 
-        // Build the refund request
         $creditCard = new AnetAPI\CreditCardType();
         $creditCard->setCardNumber($cardNumber);
         $creditCard->setExpirationDate('XXXX');
@@ -452,22 +522,66 @@ class Sdk
         $transactionRequest->setPayment($payment);
         $transactionRequest->setRefTransId($transId);
 
+        // Carry the original transaction's invoice number onto the refund so it
+        // stays traceable in the Authorize.Net merchant interface; without an
+        // order element the refund shows with no invoice number.
+        $invoiceNumber = $transactionDetails->getInvoiceNumber();
+        if ($invoiceNumber !== null && $invoiceNumber !== '') {
+            $order = new AnetAPI\OrderType();
+            $order->setInvoiceNumber($invoiceNumber);
+            $transactionRequest->setOrder($order);
+        }
+
+        return self::executeTransactionRequest($paymentProfile, $transactionRequest, 'Refund transaction was not approved.');
+    }
+
+    /**
+     * Void an unsettled transaction. This reverses the full amount; Authorize.Net
+     * does not support partial voids.
+     *
+     * @return array{success: bool, provider_refund_id?: string, voided?: bool, error?: string}
+     */
+    public static function void(PaymentProfile $paymentProfile, string $transId): array
+    {
+        self::autoload();
+
+        $transactionRequest = new AnetAPI\TransactionRequestType();
+        $transactionRequest->setTransactionType('voidTransaction');
+        $transactionRequest->setRefTransId($transId);
+
+        $result = self::executeTransactionRequest($paymentProfile, $transactionRequest, 'Void transaction was not approved.');
+        if (!empty($result['success'])) {
+            $result['voided'] = true;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Send a CreateTransactionRequest (refund or void) and normalise the response
+     * into the shared result shape. Keeps the gateway/API-message handling in one
+     * place so both refunds and voids surface errors identically.
+     *
+     * @return array{success: bool, provider_refund_id?: string, error?: string}
+     */
+    protected static function executeTransactionRequest(
+        PaymentProfile $paymentProfile,
+        AnetAPI\TransactionRequestType $transactionRequest,
+        string $notApprovedError
+    ): array {
         $request = new AnetAPI\CreateTransactionRequest();
         $request->setMerchantAuthentication(self::newMerchantAuthentication($paymentProfile));
         $request->setTransactionRequest($transactionRequest);
 
         $controller = new AnetController\CreateTransactionController($request);
 
-        try
-        {
+        try {
             /** @var AnetAPI\CreateTransactionResponse $apiResponse */
-            $apiResponse = self::chooseEndpointAndExecute($controller);
+            $apiResponse = self::chooseEndpointAndExecute($controller, self::isLive($paymentProfile));
 
-            if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK)
-            {
+            if ($apiResponse->getMessages()->getResultCode() == self::RESPONSE_OK) {
                 $transactionResponse = $apiResponse->getTransactionResponse();
-                if ($transactionResponse && $transactionResponse->getResponseCode() == self::RESPONSE_CODE_TRANSACTION_APPROVED)
-                {
+                if ($transactionResponse && $transactionResponse->getResponseCode() == self::RESPONSE_CODE_TRANSACTION_APPROVED) {
                     return [
                         'success' => true,
                         'provider_refund_id' => $transactionResponse->getTransId(),
@@ -476,40 +590,63 @@ class Sdk
 
                 // Transaction not approved
                 $errors = [];
-                if ($transactionResponse && $transactionResponse->getErrors())
-                {
-                    foreach ($transactionResponse->getErrors() as $error)
-                    {
+                if ($transactionResponse && $transactionResponse->getErrors()) {
+                    foreach ($transactionResponse->getErrors() as $error) {
                         $errors[] = $error->getErrorText();
                     }
                 }
 
                 return [
                     'success' => false,
-                    'error' => $errors ? implode(', ', $errors) : 'Refund transaction was not approved.',
+                    'error' => $errors ? implode(', ', $errors) : $notApprovedError,
                 ];
             }
-            else
-            {
-                $messages = [];
-                foreach ($apiResponse->getMessages()->getMessage() as $message)
-                {
-                    $messages[] = $message->getText();
-                }
 
-                return [
-                    'success' => false,
-                    'error' => implode(', ', $messages),
-                ];
+            $messages = [];
+            foreach ($apiResponse->getMessages()->getMessage() as $message) {
+                $messages[] = $message->getText();
             }
-        }
-        catch (\Exception $e)
-        {
+
+            return [
+                'success' => false,
+                'error' => implode(', ', $messages),
+            ];
+        } catch (\Exception $e) {
             return [
                 'success' => false,
                 'error' => $e->getMessage(),
             ];
         }
+    }
+
+    /**
+     * Authorize.Net order descriptions must contain only alphanumeric characters
+     * plus a small set of punctuation ( . , - _ / ) and spaces. Replace anything
+     * else with a space, then collapse runs and trim so the result stays readable.
+     */
+    public static function sanitizeDescription(?string $description): string
+    {
+        $description = (string) $description;
+        $description = preg_replace('/[^A-Za-z0-9 .,\-_\/]/', ' ', $description);
+        $description = preg_replace('/\s+/', ' ', $description);
+
+        return trim($description);
+    }
+
+    /**
+     * Resolve the currency the payment profile is configured to process, as set
+     * by the admin in the payment profile options. Authorize.Net accounts settle
+     * in a single currency, so this is the one currency the profile accepts.
+     * Defaults to USD when unset (profiles saved before the option existed).
+     *
+     * @param PaymentProfile $paymentProfile
+     * @return string
+     */
+    public static function getCurrency(PaymentProfile $paymentProfile): string
+    {
+        $currency = $paymentProfile->options['currency'] ?? '';
+
+        return is_string($currency) && $currency !== '' ? $currency : 'USD';
     }
 
     /**
@@ -563,17 +700,40 @@ class Sdk
     }
 
     /**
+     * Ensure the purchase's currency matches the one the payment profile is
+     * configured to process. Authorize.Net accounts settle in a single currency,
+     * so a mismatch can never succeed and is rejected up front.
+     *
+     * @param PaymentProfile $paymentProfile
+     * @param Purchase $purchase
+     * @return void
+     * @throws \InvalidArgumentException
+     */
+    private static function assertCurrency($paymentProfile, $purchase)
+    {
+        $currency = self::getCurrency($paymentProfile);
+        if ($purchase->currency !== $currency) {
+            throw new \InvalidArgumentException(sprintf(
+                'Currency %s is not supported by this payment profile (expected %s)',
+                $purchase->currency,
+                $currency
+            ));
+        }
+    }
+
+    /**
      * @param AnetController\base\ApiOperationBase $controller
+     * @param bool $live
      * @return AnetAPI\ANetApiResponseType
      * @throws \Exception
      */
-    private static function chooseEndpointAndExecute($controller)
+    private static function chooseEndpointAndExecute($controller, $live)
     {
         if (\XF::$debugMode) {
             $controller->httpClient->setLogFile(File::getTempDir() . '/authorizenet.log');
         }
 
-        $response = $controller->executeWithApiResponse(self::getEndpoint());
+        $response = $controller->executeWithApiResponse(self::getEndpoint($live));
 
         return $response;
     }
@@ -592,7 +752,7 @@ class Sdk
         $transactionKey,
         $url,
         $method = 'GET',
-        array $json = null
+        ?array $json = null
     ) {
         $client = \XF::app()->http()->client();
 
@@ -642,15 +802,33 @@ class Sdk
     }
 
     /**
+     * Whether the given payment profile transacts against Authorize.Net's live
+     * (production) environment. Controlled per profile via the "environment"
+     * option in the admin control panel.
+     *
+     * The legacy global \XF::config('enableLivePayments') flag is read once, at
+     * upgrade time, and migrated into this option (see Setup::upgrade1050500Step1);
+     * verifyConfig() also normalises it on every save. A configured profile
+     * therefore always carries an explicit value, and anything that is not an
+     * explicit "production" selection is treated as the safe sandbox default.
+     *
+     * @param PaymentProfile $paymentProfile
+     * @return bool
+     */
+    public static function isLive(PaymentProfile $paymentProfile): bool
+    {
+        return ($paymentProfile->options['environment'] ?? 'sandbox') === 'production';
+    }
+
+    /**
+     * @param bool $live
      * @return string
      */
-    private static function getEndpoint()
+    private static function getEndpoint($live)
     {
-        if (\XF::config('enableLivePayments')) {
-            return AnetConstants\ANetEnvironment::PRODUCTION;
-        } else {
-            return AnetConstants\ANetEnvironment::SANDBOX;
-        }
+        return $live
+            ? AnetConstants\ANetEnvironment::PRODUCTION
+            : AnetConstants\ANetEnvironment::SANDBOX;
     }
 
     /**

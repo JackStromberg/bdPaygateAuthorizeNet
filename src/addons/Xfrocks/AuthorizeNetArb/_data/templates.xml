@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <templates>
-  <template type="admin" title="payment_profile_authorizenet" version_id="1050000" version_string="1.5.0"><![CDATA[<xf:textboxrow name="options[api_login_id]" value="{$profile.options.api_login_id}"
+  <template type="admin" title="payment_profile_authorizenet" version_id="1050500" version_string="1.5.5"><![CDATA[<xf:textboxrow name="options[api_login_id]" value="{$profile.options.api_login_id}"
                label="{{ phrase('Xfrocks_AuthorizeNetArb_api_login_id') }}"
                explain="{{ phrase('Xfrocks_AuthorizeNetArb_api_login_id_explain') }}"
                hint="{{ phrase('required') }}"/>
@@ -18,6 +18,26 @@
                label="{{ phrase('Xfrocks_AuthorizeNetArb_public_client_key') }}"
                explain="{{ phrase('Xfrocks_AuthorizeNetArb_public_client_key_explain') }}"
                hint="{{ phrase('required') }}"/>
+
+<xf:selectrow name="options[environment]" value="{{ $profile.options.environment ?: 'sandbox' }}"
+              label="{{ phrase('Xfrocks_AuthorizeNetArb_environment') }}"
+              explain="{{ phrase('Xfrocks_AuthorizeNetArb_environment_explain') }}"
+              hint="{{ phrase('required') }}">
+    <xf:option value="sandbox">{{ phrase('Xfrocks_AuthorizeNetArb_environment_sandbox') }}</xf:option>
+    <xf:option value="production">{{ phrase('Xfrocks_AuthorizeNetArb_environment_production') }}</xf:option>
+</xf:selectrow>
+
+<xf:selectrow name="options[currency]" value="{{ $profile.options.currency ?: 'USD' }}"
+              label="{{ phrase('Xfrocks_AuthorizeNetArb_currency') }}"
+              explain="{{ phrase('Xfrocks_AuthorizeNetArb_currency_explain') }}"
+              hint="{{ phrase('required') }}">
+    <xf:option value="USD">USD - US Dollar</xf:option>
+    <xf:option value="CAD">CAD - Canadian Dollar</xf:option>
+    <xf:option value="GBP">GBP - British Pound</xf:option>
+    <xf:option value="EUR">EUR - Euro</xf:option>
+    <xf:option value="AUD">AUD - Australian Dollar</xf:option>
+    <xf:option value="NZD">NZD - New Zealand Dollar</xf:option>
+</xf:selectrow>
 
 <xf:checkboxrow label="" explain="{{ phrase('Xfrocks_AuthorizeNetArb_require_explain') }}">
     <xf:option name="options[require_names]" value="1" selected="{$profile.options.require_names}">
@@ -66,7 +86,7 @@
 		{{ phrase('button.cancel') }}
 	</xf:button>
 </div>]]></template>
-  <template type="public" title="Xfrocks_AuthorizeNetArb_payment_initiate" version_id="1050300" version_string="1.5.3"><![CDATA[<xf:css src="payment_initiate.less" />
+  <template type="public" title="Xfrocks_AuthorizeNetArb_payment_initiate" version_id="1050500" version_string="1.5.5"><![CDATA[<xf:css src="payment_initiate.less" />
 <xf:js src="Xfrocks/AuthorizeNetArb/payment.js" min="1" addon="Xfrocks/AuthorizeNetArb" />
 
 <xf:title>{{ phrase('enter_payment_details') }}</xf:title>
@@ -212,8 +232,8 @@
                 </xf:if>
 
                 <xf:if is="{$paymentProfile.options.require_phone_number}">
-                    <xf:textboxrow label="{{ phrase('Xfrocks_AuthorizeNetArb_phone_number') }}" name="phone"
-                        maxlength="15" style="width: 10em;" required="required" autocomplete="phone"
+                    <xf:textboxrow label="{{ phrase('Xfrocks_AuthorizeNetArb_phone_number') }}" name="phone_number"
+                        maxlength="15" style="width: 10em;" required="required" autocomplete="tel"
                         placeholder="555-555-5555" />
                 </xf:if>
 
